@@ -446,31 +446,18 @@ where
             let mut inbox = self.inbox.lock().unwrap();
             if let Some(message) = inbox.pending_msges.get_mut(&message_id) {
                 let mc = MessageChunk::new(mp);
-                // Make sure the data is within bounds of the message being sent.
-                if message.len < mc.chunk_offset() + mc.chunk_size() {
-                    debug!("Dropping invalid message CHUNK for being out of bounds");
-                    return;
-                }
-                // Check max chunk idx.
-                let max_chunk_idx = if message.len == 0 {
-                    0
-                } else {
-                    message.len.div_ceil(MINIMUM_CHUNK_SIZE) - 1
-                };
-                if mc.chunk_idx() > max_chunk_idx {
-                    debug!("Dropping CHUNK because index is too high");
-                    return;
-                }
-                // Check chunk size, allow exception on last chunk. The last chunk is the one
-                // that ends the message: senders split at AVERAGE_CHUNK_SIZE, so its index is
-                // generally not `max_chunk_idx` (a 1529 byte message is chunk 0 with 1300
-                // bytes and chunk 1 with 229 bytes, while `max_chunk_idx` is 6).
-                let is_last_chunk = mc.chunk_offset() + mc.chunk_size() == message.len;
-                if mc.chunk_size() < MINIMUM_CHUNK_SIZE && !is_last_chunk {
+                if let Err(reason) = check_chunk(
+                    message.len,
+                    mc.chunk_idx(),
+                    mc.chunk_offset(),
+                    mc.chunk_size(),
+                ) {
                     debug!(
-                        "Dropping CHUNK {}/{max_chunk_idx} which is too small ({} bytes / {MINIMUM_CHUNK_SIZE} bytes)",
+                        "Dropping CHUNK {} ({} bytes at offset {}) of {} byte message: {reason}",
                         mc.chunk_idx(),
-                        mc.chunk_size()
+                        mc.chunk_size(),
+                        mc.chunk_offset(),
+                        message.len,
                     );
                     return;
                 }
@@ -1916,106 +1903,69 @@ mod tests {
     }
 }
 
+/// Checks whether a chunk can belong to a message of `message_len` bytes.
+fn check_chunk(
+    message_len: u64,
+    chunk_idx: u64,
+    chunk_offset: u64,
+    chunk_size: u64,
+) -> Result<(), &'static str> {
+    // Make sure the data is within bounds of the message being sent.
+    // Both values come from the network, so their sum may overflow.
+    let chunk_end = chunk_offset
+        .checked_add(chunk_size)
+        .filter(|&end| end <= message_len)
+        .ok_or("out of bounds")?;
+    // Every chunk but the last has at least MINIMUM_CHUNK_SIZE bytes, so no index can
+    // be higher than this. This bounds the chunk array a sender can make us allocate.
+    let max_chunk_idx = message_len.div_ceil(MINIMUM_CHUNK_SIZE).saturating_sub(1);
+    if chunk_idx > max_chunk_idx {
+        return Err("index too high");
+    }
+    // Only the last chunk, the one that ends the message, may be smaller.
+    // Senders split at AVERAGE_CHUNK_SIZE, so its index is generally not `max_chunk_idx`.
+    if chunk_size < MINIMUM_CHUNK_SIZE && chunk_end != message_len {
+        return Err("too small and not the last chunk");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod chunk_reception_tests {
-    use std::net::{IpAddr, Ipv6Addr};
+    use super::{check_chunk, AVERAGE_CHUNK_SIZE};
 
-    use super::{
-        MessageChunk, MessageId, MessageInit, MessagePacket, MessageStack, AVERAGE_CHUNK_SIZE,
-    };
-    use crate::{
-        crypto::{PacketBuffer, PublicKey, SecretKey},
-        data::DataPlane,
-        metrics::Metrics,
-        packet_queue::IncomingPacketQueue,
-        router::Router,
-        subnet::Subnet,
-    };
-
-    #[derive(Clone)]
-    struct NoMetrics;
-    impl Metrics for NoMetrics {}
-
-    /// A message stack on a data plane without TUN and without peers: replies (ACKs) go
-    /// nowhere, which doesn't matter for what the receiver keeps.
-    fn message_stack() -> MessageStack<NoMetrics> {
-        let sk = SecretKey::new();
-        let pk = PublicKey::from(&sk);
-        let subnet = Subnet::new(IpAddr::V6(Ipv6Addr::new(0x400, 0, 0, 0, 0, 0, 0, 1)), 64)
-            .expect("Valid subnet");
-        let (node_tun, tun_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (router, pending_packet_rx, timeout_packet_rx, incoming_route_rx) = Router::new(
-            1,
-            node_tun,
-            subnet,
-            vec![subnet],
-            (sk, pk),
-            vec![],
-            NoMetrics,
-        )
-        .expect("Can create router");
-        let data_plane = DataPlane::new(
-            router,
-            tokio_stream::pending(),
-            futures::sink::drain(),
-            futures::sink::drain(),
-            tun_rx,
-            pending_packet_rx,
-            timeout_packet_rx,
-            IncomingPacketQueue::new(),
-            incoming_route_rx,
-        );
-        MessageStack::new(data_plane, tokio_stream::pending(), None)
-    }
-
-    /// Feeds the receiver the INIT and every chunk of a `len` byte message, split the way
-    /// the sender splits it, and reports whether it kept every chunk.
-    fn receives_all_chunks(ms: &MessageStack<NoMetrics>, len: usize) -> bool {
-        let id = MessageId::new();
-        let src = IpAddr::V6(Ipv6Addr::new(0x400, 0, 0, 0, 0, 0, 0, 2));
-        let dst = IpAddr::V6(Ipv6Addr::new(0x400, 0, 0, 0, 0, 0, 0, 1));
-        let data = vec![7u8; len];
-
-        let mut mp = MessagePacket::new(PacketBuffer::new());
-        mp.header_mut().set_message_id(id);
-        let mut mi = MessageInit::new(mp);
-        mi.set_length(len as u64);
-        mi.set_topic(b"test");
-        ms.handle_message(mi.into_inner(), src, dst);
-
-        for (chunk_idx, chunk_data) in data.chunks(AVERAGE_CHUNK_SIZE).enumerate() {
-            let mut mp = MessagePacket::new(PacketBuffer::new());
-            mp.header_mut().set_message_id(id);
-            let mut mc = MessageChunk::new(mp);
-            mc.set_chunk_idx(chunk_idx as u64);
-            mc.set_chunk_offset((chunk_idx * AVERAGE_CHUNK_SIZE) as u64);
-            mc.set_chunk_data(chunk_data)
-                .expect("Chunk fits in a packet");
-            ms.handle_message(mc.into_inner(), src, dst);
-        }
-
-        let inbox = ms.inbox.lock().unwrap();
-        let message = inbox
-            .pending_msges
-            .get(&id)
-            .expect("Message is pending after INIT");
-        message.chunks.iter().all(Option::is_some)
-    }
-
-    #[tokio::test]
-    async fn every_chunk_of_a_message_is_received() {
-        let ms = message_stack();
+    #[test]
+    fn every_chunk_of_a_message_is_accepted() {
         // Lengths around the chunk boundaries. 1301, 1529, 1549, 2601 and 2849 bytes end
         // in a chunk shorter than MINIMUM_CHUNK_SIZE (250 bytes).
-        let failing: Vec<usize> = [
+        for len in [
             1, 249, 250, 1299, 1300, 1301, 1529, 1549, 1550, 2600, 2601, 2849, 2850, 65_000,
-        ]
-        .into_iter()
-        .filter(|&len| !receives_all_chunks(&ms, len))
-        .collect();
-        assert!(
-            failing.is_empty(),
-            "messages of these lengths lose their last chunk: {failing:?}"
-        );
+        ] {
+            // Split the way the sender splits.
+            let data = vec![7u8; len];
+            for (idx, chunk) in data.chunks(AVERAGE_CHUNK_SIZE).enumerate() {
+                let offset = (idx * AVERAGE_CHUNK_SIZE) as u64;
+                assert_eq!(
+                    check_chunk(len as u64, idx as u64, offset, chunk.len() as u64),
+                    Ok(()),
+                    "len {len}, chunk {idx} ({} bytes at {offset})",
+                    chunk.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_chunks_are_rejected() {
+        // Beyond the end of the message.
+        assert!(check_chunk(1000, 0, 900, 200).is_err());
+        // Offset and size whose sum overflows.
+        assert!(check_chunk(1000, 0, u64::MAX, 2).is_err());
+        // Small chunk that doesn't end the message.
+        assert!(check_chunk(2000, 0, 0, 100).is_err());
+        // Index beyond what the minimum chunk size allows.
+        assert!(check_chunk(1000, 4, 999, 1).is_err());
+        // A small chunk that ends the message is fine.
+        assert_eq!(check_chunk(1000, 3, 900, 100), Ok(()));
     }
 }
