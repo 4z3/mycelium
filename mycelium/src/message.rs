@@ -461,8 +461,12 @@ where
                     debug!("Dropping CHUNK because index is too high");
                     return;
                 }
-                // Check chunk size, allow exception on last chunk.
-                if mc.chunk_size() < MINIMUM_CHUNK_SIZE && mc.chunk_idx() != max_chunk_idx {
+                // Check chunk size, allow exception on last chunk. The last chunk is the one
+                // that ends the message: senders split at AVERAGE_CHUNK_SIZE, so its index is
+                // generally not `max_chunk_idx` (a 1529 byte message is chunk 0 with 1300
+                // bytes and chunk 1 with 229 bytes, while `max_chunk_idx` is 6).
+                let is_last_chunk = mc.chunk_offset() + mc.chunk_size() == message.len;
+                if mc.chunk_size() < MINIMUM_CHUNK_SIZE && !is_last_chunk {
                     debug!(
                         "Dropping CHUNK {}/{max_chunk_idx} which is too small ({} bytes / {MINIMUM_CHUNK_SIZE} bytes)",
                         mc.chunk_idx(),
