@@ -1911,3 +1911,107 @@ mod tests {
         assert_eq!(buf_mut.header[8], 0b1000_0001);
     }
 }
+
+#[cfg(test)]
+mod chunk_reception_tests {
+    use std::net::{IpAddr, Ipv6Addr};
+
+    use super::{
+        MessageChunk, MessageId, MessageInit, MessagePacket, MessageStack, AVERAGE_CHUNK_SIZE,
+    };
+    use crate::{
+        crypto::{PacketBuffer, PublicKey, SecretKey},
+        data::DataPlane,
+        metrics::Metrics,
+        packet_queue::IncomingPacketQueue,
+        router::Router,
+        subnet::Subnet,
+    };
+
+    #[derive(Clone)]
+    struct NoMetrics;
+    impl Metrics for NoMetrics {}
+
+    /// A message stack on a data plane without TUN and without peers: replies (ACKs) go
+    /// nowhere, which doesn't matter for what the receiver keeps.
+    fn message_stack() -> MessageStack<NoMetrics> {
+        let sk = SecretKey::new();
+        let pk = PublicKey::from(&sk);
+        let subnet = Subnet::new(IpAddr::V6(Ipv6Addr::new(0x400, 0, 0, 0, 0, 0, 0, 1)), 64)
+            .expect("Valid subnet");
+        let (node_tun, tun_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (router, pending_packet_rx, timeout_packet_rx, incoming_route_rx) = Router::new(
+            1,
+            node_tun,
+            subnet,
+            vec![subnet],
+            (sk, pk),
+            vec![],
+            NoMetrics,
+        )
+        .expect("Can create router");
+        let data_plane = DataPlane::new(
+            router,
+            tokio_stream::pending(),
+            futures::sink::drain(),
+            futures::sink::drain(),
+            tun_rx,
+            pending_packet_rx,
+            timeout_packet_rx,
+            IncomingPacketQueue::new(),
+            incoming_route_rx,
+        );
+        MessageStack::new(data_plane, tokio_stream::pending(), None)
+    }
+
+    /// Feeds the receiver the INIT and every chunk of a `len` byte message, split the way
+    /// the sender splits it, and reports whether it kept every chunk.
+    fn receives_all_chunks(ms: &MessageStack<NoMetrics>, len: usize) -> bool {
+        let id = MessageId::new();
+        let src = IpAddr::V6(Ipv6Addr::new(0x400, 0, 0, 0, 0, 0, 0, 2));
+        let dst = IpAddr::V6(Ipv6Addr::new(0x400, 0, 0, 0, 0, 0, 0, 1));
+        let data = vec![7u8; len];
+
+        let mut mp = MessagePacket::new(PacketBuffer::new());
+        mp.header_mut().set_message_id(id);
+        let mut mi = MessageInit::new(mp);
+        mi.set_length(len as u64);
+        mi.set_topic(b"test");
+        ms.handle_message(mi.into_inner(), src, dst);
+
+        for (chunk_idx, chunk_data) in data.chunks(AVERAGE_CHUNK_SIZE).enumerate() {
+            let mut mp = MessagePacket::new(PacketBuffer::new());
+            mp.header_mut().set_message_id(id);
+            let mut mc = MessageChunk::new(mp);
+            mc.set_chunk_idx(chunk_idx as u64);
+            mc.set_chunk_offset((chunk_idx * AVERAGE_CHUNK_SIZE) as u64);
+            mc.set_chunk_data(chunk_data)
+                .expect("Chunk fits in a packet");
+            ms.handle_message(mc.into_inner(), src, dst);
+        }
+
+        let inbox = ms.inbox.lock().unwrap();
+        let message = inbox
+            .pending_msges
+            .get(&id)
+            .expect("Message is pending after INIT");
+        message.chunks.iter().all(Option::is_some)
+    }
+
+    #[tokio::test]
+    async fn every_chunk_of_a_message_is_received() {
+        let ms = message_stack();
+        // Lengths around the chunk boundaries. 1301, 1529, 1549, 2601 and 2849 bytes end
+        // in a chunk shorter than MINIMUM_CHUNK_SIZE (250 bytes).
+        let failing: Vec<usize> = [
+            1, 249, 250, 1299, 1300, 1301, 1529, 1549, 1550, 2600, 2601, 2849, 2850, 65_000,
+        ]
+        .into_iter()
+        .filter(|&len| !receives_all_chunks(&ms, len))
+        .collect();
+        assert!(
+            failing.is_empty(),
+            "messages of these lengths lose their last chunk: {failing:?}"
+        );
+    }
+}
